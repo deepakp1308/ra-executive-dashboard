@@ -1719,93 +1719,123 @@ function toggleGlossary(btn) {
 //  DATA FETCH & ORCHESTRATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  STATIC SNAPSHOT MODE — reads from snapshot_matrix.json (no Flask server)
-// ═══════════════════════════════════════════════════════════════════════════════
-let SNAPSHOT_MATRIX = null;
-async function loadMatrix() {
-  if (SNAPSHOT_MATRIX) return SNAPSHOT_MATRIX;
-  try {
-    const r = await fetch('snapshot_matrix.json');
-    SNAPSHOT_MATRIX = await r.json();
-    return SNAPSHOT_MATRIX;
-  } catch(e) { return null; }
+// Fix 7: fetch with AbortController timeout
+function fetchWithTimeout(url, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer));
 }
 
-function getSnapshotKey() {
-  return state.ecu + '|' + state.hvc + '|' + state.granularity;
-}
-
-function filterByDateRange(arr) {
-  if (!arr || !arr.length || state.dateRange === 'all') return arr;
-  const days = parseInt(state.dateRange);
-  if (isNaN(days)) return arr;
-  if (state.granularity === 'monthly') {
-    return arr.slice(-Math.max(1, Math.ceil(days / 30)));
+// Fix 4: data freshness display
+function updateFreshness(meta) {
+  const el = document.getElementById("data-freshness");
+  if (!el || !meta) return;
+  const extracted = new Date(meta.extracted_at);
+  const ageMs = Date.now() - extracted.getTime();
+  const ageHours = Math.floor(ageMs / 3600000);
+  const ageMin = Math.floor((ageMs % 3600000) / 60000);
+  const cacheLabel = meta.cache_hit ? "cached" : "fresh";
+  if (ageHours >= 12) {
+    el.innerHTML = `<span style="color:var(--amber);">Data ${ageHours}h old (${cacheLabel})</span>`;
+  } else if (ageHours >= 1) {
+    el.textContent = `Refreshed ${ageHours}h ${ageMin}m ago (${cacheLabel})`;
+  } else {
+    el.textContent = `Refreshed ${ageMin}m ago (${cacheLabel})`;
   }
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - days);
-  return arr.filter(d => d.period_start >= cutoff.toISOString().slice(0, 10));
-}
-
-function clearAllContainers(msg) {
-  ["exec-summary-wow", "exec-summary-yoy",
-   "kpi-grid-container", "overview-charts", "i2a-section",
-   "engagement-section", "adoption-section", "page-funnel-container"]
-    .forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.innerHTML = msg || '';
-    });
 }
 
 async function loadData() {
   Object.values(chartInstances).forEach(c => c.destroy());
   Object.keys(chartInstances).forEach(k => delete chartInstances[k]);
-  clearAllContainers('<div class="state-box"><div class="spinner"></div> Loading…</div>');
 
-  const matrix = await loadMatrix();
-  if (!matrix) {
-    clearAllContainers('<div class="state-box"><strong style="color:var(--red)">Failed to load snapshot data</strong></div>');
-    return;
-  }
-
-  const key = getSnapshotKey();
-  const snapshot = matrix[key];
-  if (!snapshot) {
-    clearAllContainers('<div class="state-box"><strong>No data for this filter combination</strong></div>');
-    return;
-  }
+  // Show loading on all containers
+  ["exec-summary-wow", "exec-summary-yoy",
+   "kpi-grid-container", "overview-charts", "i2a-section", "engagement-section", "adoption-section", "page-funnel-container"]
+    .forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = `<div class="state-box"><div class="spinner"></div> Loading…</div>`;
+    });
 
   try {
-    const metricsData = filterByDateRange(snapshot.metrics || []);
-    const i2aData = filterByDateRange(snapshot.i2a || []);
-    const adoptionData = filterByDateRange(snapshot.adoption || []);
-    const engagementData = filterByDateRange(snapshot.engagement || []);
-    const summaryWoW = snapshot.summary_wow || null;
-    const summaryYoY = snapshot.summary_yoy || null;
-    const funnelData = filterByDateRange(snapshot.page_funnel || []);
+    const params = { ecu: state.ecu, hvc: state.hvc, granularity: state.granularity, tenure: "all", date_start: state.date_start };
+    if (state.date_end) params.date_end = state.date_end;
+    const qs = new URLSearchParams(params).toString();
+
+    // Fetch all 6 APIs in parallel — TWO executive summaries (WoW + YoY)
+    const [metricsRes, adoptionRes, i2aRes, engagementRes, summaryWoWRes, summaryYoYRes, funnelRes] = await Promise.all([
+      fetchWithTimeout("/api/metrics?" + qs),
+      fetchWithTimeout("/api/adoption?" + qs),
+      fetchWithTimeout("/api/i2a?" + qs, 120000),
+      fetchWithTimeout("/api/engagement?" + qs),
+      fetchWithTimeout("/api/executive-summary?" + qs + "&compare=wow"),
+      fetchWithTimeout("/api/executive-summary?" + qs + "&compare=yoy"),
+      fetchWithTimeout("/api/page-funnel?" + qs),
+    ]);
+
+    if (!metricsRes.ok) {
+      const errBody = await metricsRes.json().catch(() => ({}));
+      throw new Error(errBody.error || `Metrics API returned ${metricsRes.status}`);
+    }
+
+    const metricsData = await metricsRes.json();
+    const i2aData = i2aRes.ok ? await i2aRes.json() : [];
+
+    const adoptionJson = adoptionRes.ok ? await adoptionRes.json() : {};
+    const adoptionData = Array.isArray(adoptionJson) ? adoptionJson : (adoptionJson.data || []);
+    const adoptionMeta = adoptionJson.meta || null;
+
+    const engagementJson = engagementRes.ok ? await engagementRes.json() : {};
+    const engagementData = Array.isArray(engagementJson) ? engagementJson : (engagementJson.data || []);
+
+    const summaryWoW = summaryWoWRes.ok ? await summaryWoWRes.json() : null;
+    const summaryYoY = summaryYoYRes.ok ? await summaryYoYRes.json() : null;
+    const funnelData = funnelRes.ok ? await funnelRes.json() : [];
+
     const adoptionMap = new Map(adoptionData.map(d => [d.period_start, d]));
 
     if (!metricsData.length) {
-      clearAllContainers('<div class="state-box">No data for this date range.</div>');
+      document.getElementById("overview-charts").innerHTML =
+        `<div class="state-box">No data for the selected filters.</div>`;
       return;
     }
 
+    // ── Render dual summaries on BOTH pages ──
     renderExecSummary(summaryWoW, "exec-summary-wow", "Week-over-Week");
     renderExecSummary(summaryYoY, "exec-summary-yoy", "Year-over-Year");
+    // ── Render Page 1: KPIs + Charts ──
     renderKPIGrid(metricsData, i2aData, adoptionMap);
     renderOverviewCharts(metricsData, adoptionMap, i2aData);
+
+    // ── Render Page 2: I2A + Engagement ──
     renderI2ASection(i2aData);
     renderEngagementSection(engagementData);
-    document.getElementById("adoption-section").innerHTML = '';
+    document.getElementById("adoption-section").innerHTML = "";
+
+    // ── Render Page 3: Page Funnels ──
     renderPageFunnels(funnelData);
 
+    // Update header timestamp + freshness
     const latestWeek = metricsData[metricsData.length - 1]?.period_start ?? "";
     document.getElementById("last-updated").textContent = "Latest data: " + fmtDate(latestWeek);
-    document.getElementById("data-freshness").textContent = "Snapshot mode | Filter: " + key;
-  } catch(err) {
-    console.error(err);
-    clearAllContainers('<div class="state-box"><strong style="color:var(--red)">Error: ' + err.message + '</strong></div>');
+    if (adoptionMeta) updateFreshness(adoptionMeta);
+
+  } catch (err) {
+    const msg = err.name === "AbortError" ? "Request timed out (30s). BigQuery may be slow." : err.message;
+    const errorHtml = `
+      <div class="state-box" style="flex-direction:column;gap:8px;">
+        <strong style="color:var(--red)">Failed to load data</strong>
+        <span>${msg}</span>
+        <span style="font-size:11px;color:var(--muted)">
+          Make sure Flask server is running (<code>python server.py</code>)
+          and BigQuery credentials: <code>gcloud auth application-default login</code>
+        </span>
+      </div>`;
+    ["exec-summary-wow", "exec-summary-yoy", "overview-charts", "i2a-section", "engagement-section"]
+      .forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = errorHtml;
+      });
+    document.getElementById("kpi-grid-container").innerHTML = "";
   }
 }
 
