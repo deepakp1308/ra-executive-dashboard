@@ -581,6 +581,69 @@ function latestPrior(data, key) {
   return latest(data, prefix + key);
 }
 
+/**
+ * Returns the period_start string of the CURRENT (potentially incomplete) period.
+ * Monthly: first day of today's calendar month, e.g. "2026-04-01"
+ * Weekly:  most recent Sunday (BigQuery WEEK starts Sunday), e.g. "2026-04-13"
+ */
+function currentPeriodStart() {
+  const today = new Date();
+  if (state.granularity === "monthly") {
+    const y = today.getFullYear();
+    const m = String(today.getMonth() + 1).padStart(2, "0");
+    return `${y}-${m}-01`;
+  } else {
+    // BigQuery DATE_TRUNC(WEEK) starts on Sunday (getDay() === 0)
+    const day = today.getDay();
+    const sun = new Date(today);
+    sun.setDate(today.getDate() - day);
+    return sun.toISOString().slice(0, 10);
+  }
+}
+
+/**
+ * Like latest(), but skips the current (potentially incomplete) period so that
+ * baseline comparisons always reference the last FULLY COMPLETED month/week.
+ * E.g. in mid-April 2026 with monthly granularity this returns the March 2026 value.
+ */
+function latestComplete(data, key) {
+  const exclude = currentPeriodStart();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (data[i].period_start !== exclude && data[i][key] != null) {
+      return data[i][key];
+    }
+  }
+  return null;
+}
+
+/**
+ * Like latestAdoption, but skips the current incomplete period.
+ * Returns the most recent adoption row whose period_start != currentPeriodStart().
+ */
+function latestCompleteAdoption(adoptionMap) {
+  const rows = [...adoptionMap.values()];
+  if (!rows.length) return null;
+  const exclude = currentPeriodStart();
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].period_start !== exclude) return rows[i];
+  }
+  return rows[rows.length - 1]; // all data is historical — use last
+}
+
+/**
+ * Returns a short human label for the last complete period, e.g. "Mar '26" or "Apr 6 '26".
+ * Used to annotate baseline delta lines with context.
+ */
+function lastCompletePeriodLabel(data) {
+  const exclude = currentPeriodStart();
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (data[i].period_start !== exclude) {
+      return fmtDate(data[i].period_start);
+    }
+  }
+  return "latest";
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  BASELINE COMPARISON — % improvement since Jul 30, 2025
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -606,22 +669,24 @@ function findBaselineAdoption(adoptionMap, key) {
   return row ? (row[key] ?? null) : null;
 }
 
-function baselineDelta(cur, baseline) {
+function baselineDelta(cur, baseline, curLabel) {
   if (cur == null || baseline == null || baseline === 0) return "";
   const diff = cur - baseline;
   const cls = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
   const arrow = diff > 0 ? "▲" : diff < 0 ? "▼" : "—";
   const sign = diff > 0 ? "+" : "";
-  return `<span class="kpi-delta ${cls}">${arrow} ${sign}${diff.toFixed(1)} pp since ${BASELINE_LABEL}</span>`;
+  const suffix = curLabel ? ` (${BASELINE_LABEL} → ${curLabel})` : ` since ${BASELINE_LABEL}`;
+  return `<span class="kpi-delta ${cls}">${arrow} ${sign}${diff.toFixed(1)} pp${suffix}</span>`;
 }
 
-function baselineDeltaRatio(cur, baseline) {
+function baselineDeltaRatio(cur, baseline, curLabel) {
   if (cur == null || baseline == null || baseline === 0) return "";
   const diff = cur - baseline;
   const cls = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
   const arrow = diff > 0 ? "▲" : diff < 0 ? "▼" : "—";
   const sign = diff > 0 ? "+" : "";
-  return `<span class="kpi-delta ${cls}">${arrow} ${sign}${diff.toFixed(2)} since ${BASELINE_LABEL}</span>`;
+  const suffix = curLabel ? ` (${BASELINE_LABEL} → ${curLabel})` : ` since ${BASELINE_LABEL}`;
+  return `<span class="kpi-delta ${cls}">${arrow} ${sign}${diff.toFixed(2)}${suffix}</span>`;
 }
 
 // Returns the index of the baseline period in a labels array, or -1
@@ -965,11 +1030,19 @@ function renderKPIGrid(data, i2aData, adoptionMap) {
   const pyRaTotal = null;
   const pwRaTotal = null;
 
-  // Baseline values (Jul 30 '25)
+  // Baseline values (Jul 30 '25) — anchor point
   const blRevPct = findBaselineValue(data, "pct_attributed_rev");
   const blCampPct = findBaselineValue(i2aData, "pct_campaigns_created");
   const blActionsPct = findBaselineValue(i2aData, "pct_actions_taken");
   const blRaTotal = findBaselineAdoption(adoptionMap, "pct_ra_total");
+
+  // "Current" for baseline delta = last FULLY COMPLETED period (not partial current month/week)
+  const blCurRevPct = latestComplete(data, "pct_attributed_rev");
+  const blCurCampPct = latestComplete(i2aData, "pct_campaigns_created");
+  const blCurActionsPct = latestComplete(i2aData, "pct_actions_taken");
+  const blCurAdoption = latestCompleteAdoption(adoptionMap);
+  const blCurRaTotal = blCurAdoption?.pct_ra_total ?? null;
+  const completePeriodLabel = lastCompletePeriodLabel(data.length ? data : i2aData);
 
   el.innerHTML = `
     <div class="kpi-grid">
@@ -977,25 +1050,25 @@ function renderKPIGrid(data, i2aData, adoptionMap) {
         <div class="kpi-mini-label">% Attributed Revenue</div>
         <div class="kpi-mini-value">${noEcomm ? "N/A" : fmtPct(revPct)}</div>
         <div class="kpi-mini-delta">${noEcomm ? "" : deltaBoth(revPct, pwRevPct, pyRevPct)}</div>
-        <div class="kpi-mini-delta">${noEcomm ? "" : baselineDelta(revPct, blRevPct)}</div>
+        <div class="kpi-mini-delta">${noEcomm ? "" : baselineDelta(blCurRevPct, blRevPct, completePeriodLabel)}</div>
       </div>
       <div class="kpi-mini">
         <div class="kpi-mini-label">% Created Campaign (7d)</div>
         <div class="kpi-mini-value">${fmtPct(campPct)}</div>
         <div class="kpi-mini-delta">${deltaBoth(campPct, pwCampPct, pyCampPct)}</div>
-        <div class="kpi-mini-delta">${baselineDelta(campPct, blCampPct)}</div>
+        <div class="kpi-mini-delta">${baselineDelta(blCurCampPct, blCampPct, completePeriodLabel)}</div>
       </div>
       <div class="kpi-mini">
         <div class="kpi-mini-label">% Any Action I2A (7d)</div>
         <div class="kpi-mini-value">${fmtPct(actionsPct)}</div>
         <div class="kpi-mini-delta">${deltaBoth(actionsPct, pwActionsPct, pyActionsPct)}</div>
-        <div class="kpi-mini-delta">${baselineDelta(actionsPct, blActionsPct)}</div>
+        <div class="kpi-mini-delta">${baselineDelta(blCurActionsPct, blActionsPct, completePeriodLabel)}</div>
       </div>
       <div class="kpi-mini">
         <div class="kpi-mini-label">Reporting & Analytics Adoption</div>
         <div class="kpi-mini-value">${fmtPct(raTotal)}</div>
         <div class="kpi-mini-delta">${deltaBoth(raTotal, pwRaTotal, pyRaTotal)}</div>
-        <div class="kpi-mini-delta">${baselineDelta(raTotal, blRaTotal)}</div>
+        <div class="kpi-mini-delta">${baselineDelta(blCurRaTotal, blRaTotal, completePeriodLabel)}</div>
       </div>
     </div>
     <div class="metric-card" style="margin-top:-8px;padding:0;">
@@ -1046,12 +1119,20 @@ function renderOverviewCharts(data, adoptionMap, i2aData) {
   const raTotalPct = latestAdoption?.pct_ra_total ?? null;
   const raOwnedPct = latestAdoption?.pct_ra_owned ?? null;
 
-  // Baseline values (Jul 30 '25)
+  // Baseline values (Jul 30 '25) — anchor point
   const blRevPct = findBaselineValue(data, "pct_attributed_rev");
   const blCampPct = findBaselineValue(i2aData, "pct_campaigns_created");
   const blCpu = findBaselineValue(i2aData, "campaigns_per_user");
   const blRaTotal = findBaselineAdoption(adoptionMap, "pct_ra_total");
   const blRaOwned = findBaselineAdoption(adoptionMap, "pct_ra_owned");
+
+  // "Current" for baseline delta = last FULLY COMPLETED period (not partial current month/week)
+  const blCurRevPct    = latestComplete(data, "pct_attributed_rev");
+  const blCurCampPct   = latestComplete(i2aData, "pct_campaigns_created");
+  const blCurCpu       = latestComplete(i2aData, "campaigns_per_user");
+  const blCurAdoption  = latestCompleteAdoption(adoptionMap);
+  const blCurRaTotal   = blCurAdoption?.pct_ra_total ?? null;
+  const completePeriodLabel = lastCompletePeriodLabel(data.length ? data : i2aData);
 
   // Baseline chart indices
   const blIdxMetrics = baselineIndex(data);
@@ -1075,7 +1156,7 @@ function renderOverviewCharts(data, adoptionMap, i2aData) {
       <div class="kpi-row">
         <div class="kpi-value">${noEcomm ? "N/A" : fmtPct(revPct)}</div>
         ${noEcomm ? "" : deltaBoth(revPct, pwRevPct, pyRevPct)}
-        ${noEcomm ? "" : baselineDelta(revPct, blRevPct)}
+        ${noEcomm ? "" : baselineDelta(blCurRevPct, blRevPct, completePeriodLabel)}
         ${!noEcomm && attribRev != null ? `<div class="kpi-context">${fmtCurrency(attribRev)} attributed / ${fmtCurrency(totalRev)} total GMV</div>` : ""}
       </div>
       ${noEcomm ? `<div class="na-note">Attributed revenue is only tracked for ecommerce-connected users. Switch to <strong>All</strong> or <strong>ECU</strong>.</div>` : ""}
@@ -1099,7 +1180,7 @@ function renderOverviewCharts(data, adoptionMap, i2aData) {
       <div class="kpi-row">
         <div class="kpi-value">${fmtPct(campPct)}</div>
         ${deltaBoth(campPct, pwCampPct, pyCampPct)}
-        ${baselineDelta(campPct, blCampPct)}
+        ${baselineDelta(blCurCampPct, blCampPct, completePeriodLabel)}
         ${campUsers != null ? `<div class="kpi-context">${fmtCount(campUsers)} users / ${fmtCount(latest(i2aData, "active_users"))} WAU</div>` : ""}
       </div>
       ${legendHtml}
@@ -1123,7 +1204,7 @@ function renderOverviewCharts(data, adoptionMap, i2aData) {
       <div class="kpi-row">
         <div class="kpi-value">${fmtRatio(cpu)}</div>
         ${deltaBoth(cpu, pwCpu, pyCpu, true)}
-        ${baselineDeltaRatio(cpu, blCpu)}
+        ${baselineDeltaRatio(blCurCpu, blCpu, completePeriodLabel)}
         ${totalCamp != null ? `<div class="kpi-context">${fmtCount(totalCamp)} campaigns / ${fmtCount(latest(i2aData, "active_users"))} WAU</div>` : ""}
       </div>
       ${legendHtml}
@@ -1146,7 +1227,7 @@ function renderOverviewCharts(data, adoptionMap, i2aData) {
       <div class="kpi-row">
         <div class="kpi-value">${fmtPct(raTotalPct)}</div>
         ${raOwnedPct != null ? `<span class="kpi-delta flat">Owned only: ${fmtPct(raOwnedPct)}</span>` : ""}
-        ${baselineDelta(raTotalPct, blRaTotal)}
+        ${baselineDelta(blCurRaTotal, blRaTotal, completePeriodLabel)}
         ${latestAdoption?.active_users != null ? `<div class="kpi-context">de-duped union / ${fmtCount(latestAdoption.active_users)} WAU</div>` : ""}
       </div>
       <div class="chart-legend">
