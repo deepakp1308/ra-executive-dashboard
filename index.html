@@ -1825,6 +1825,35 @@ function updateFreshness(meta) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SNAPSHOT MATRIX — static GitHub Pages mode (no live Flask backend)
+// ═══════════════════════════════════════════════════════════════════════════════
+let _snapshotMatrix = null;
+async function loadMatrix() {
+  if (_snapshotMatrix) return _snapshotMatrix;
+  const res = await fetch("snapshot_matrix.json");
+  if (!res.ok) throw new Error(`Snapshot matrix not found (HTTP ${res.status})`);
+  _snapshotMatrix = await res.json();
+  return _snapshotMatrix;
+}
+
+function getSnapshotKey() {
+  return `${state.ecu}|${state.hvc}|${state.granularity}`;
+}
+
+function filterByDateRange(rows) {
+  if (!Array.isArray(rows)) return [];
+  const start = state.date_start;
+  const end = state.date_end;
+  return rows.filter(r => {
+    const p = r.period_start;
+    if (!p) return true;
+    if (start && p < start) return false;
+    if (end && p > end) return false;
+    return true;
+  });
+}
+
 async function loadData() {
   Object.values(chartInstances).forEach(c => c.destroy());
   Object.keys(chartInstances).forEach(k => delete chartInstances[k]);
@@ -1838,41 +1867,28 @@ async function loadData() {
     });
 
   try {
-    const params = { ecu: state.ecu, hvc: state.hvc, granularity: state.granularity, tenure: "all", date_start: state.date_start };
-    if (state.date_end) params.date_end = state.date_end;
-    const qs = new URLSearchParams(params).toString();
-
-    // Fetch all 6 APIs in parallel — TWO executive summaries (WoW + YoY)
-    const [metricsRes, adoptionRes, i2aRes, engagementRes, summaryWoWRes, summaryYoYRes, funnelRes] = await Promise.all([
-      fetchWithTimeout("/api/metrics?" + qs),
-      fetchWithTimeout("/api/adoption?" + qs),
-      fetchWithTimeout("/api/i2a?" + qs, 120000),
-      fetchWithTimeout("/api/engagement?" + qs),
-      fetchWithTimeout("/api/executive-summary?" + qs + "&compare=wow"),
-      fetchWithTimeout("/api/executive-summary?" + qs + "&compare=yoy"),
-      fetchWithTimeout("/api/page-funnel?" + qs),
-    ]);
-
-    if (!metricsRes.ok) {
-      const errBody = await metricsRes.json().catch(() => ({}));
-      throw new Error(errBody.error || `Metrics API returned ${metricsRes.status}`);
+    const matrix = await loadMatrix();
+    const key = getSnapshotKey();
+    const snapshot = matrix[key];
+    if (!snapshot) {
+      throw new Error(`No snapshot for filter combo: ${key}`);
     }
 
-    const metricsData = await metricsRes.json();
-    const i2aData = i2aRes.ok ? await i2aRes.json() : [];
+    // Pull endpoint slices from the snapshot and apply date filtering client-side
+    const metricsData   = filterByDateRange(snapshot.metrics     || []);
+    const i2aData       = filterByDateRange(snapshot.i2a         || []);
+    const adoptionRaw   = snapshot.adoption;
+    const adoptionData  = Array.isArray(adoptionRaw) ? adoptionRaw : (adoptionRaw?.data || []);
+    const adoptionMeta  = Array.isArray(adoptionRaw) ? null : (adoptionRaw?.meta || null);
+    const adoptionDataF = filterByDateRange(adoptionData);
+    const engagementRaw = snapshot.engagement;
+    const engagementData = Array.isArray(engagementRaw) ? engagementRaw : (engagementRaw?.data || []);
+    const engagementDataF = filterByDateRange(engagementData);
+    const summaryWoW    = snapshot.summary_wow || null;
+    const summaryYoY    = snapshot.summary_yoy || null;
+    const funnelData    = snapshot.page_funnel || [];
 
-    const adoptionJson = adoptionRes.ok ? await adoptionRes.json() : {};
-    const adoptionData = Array.isArray(adoptionJson) ? adoptionJson : (adoptionJson.data || []);
-    const adoptionMeta = adoptionJson.meta || null;
-
-    const engagementJson = engagementRes.ok ? await engagementRes.json() : {};
-    const engagementData = Array.isArray(engagementJson) ? engagementJson : (engagementJson.data || []);
-
-    const summaryWoW = summaryWoWRes.ok ? await summaryWoWRes.json() : null;
-    const summaryYoY = summaryYoYRes.ok ? await summaryYoYRes.json() : null;
-    const funnelData = funnelRes.ok ? await funnelRes.json() : [];
-
-    const adoptionMap = new Map(adoptionData.map(d => [d.period_start, d]));
+    const adoptionMap = new Map(adoptionDataF.map(d => [d.period_start, d]));
 
     if (!metricsData.length) {
       document.getElementById("overview-charts").innerHTML =
@@ -1889,7 +1905,7 @@ async function loadData() {
 
     // ── Render Page 2: I2A + Engagement ──
     renderI2ASection(i2aData);
-    renderEngagementSection(engagementData);
+    renderEngagementSection(engagementDataF);
     document.getElementById("adoption-section").innerHTML = "";
 
     // ── Render Page 3: Page Funnels ──
@@ -1901,14 +1917,15 @@ async function loadData() {
     if (adoptionMeta) updateFreshness(adoptionMeta);
 
   } catch (err) {
-    const msg = err.name === "AbortError" ? "Request timed out (30s). BigQuery may be slow." : err.message;
+    const msg = err.name === "AbortError" ? "Request timed out. Try reloading." : err.message;
     const errorHtml = `
       <div class="state-box" style="flex-direction:column;gap:8px;">
         <strong style="color:var(--red)">Failed to load data</strong>
         <span>${msg}</span>
         <span style="font-size:11px;color:var(--muted)">
-          Make sure Flask server is running (<code>python server.py</code>)
-          and BigQuery credentials: <code>gcloud auth application-default login</code>
+          This static dashboard reads from <code>snapshot_matrix.json</code>.
+          If the file is missing or corrupted, regenerate it by running
+          <code>python generate_snapshots_direct.py</code>.
         </span>
       </div>`;
     ["exec-summary-wow", "exec-summary-yoy", "overview-charts", "i2a-section", "engagement-section"]
